@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project-specific: large files that should NOT be in git
+# (these go on Google Drive for Colab training)
+dataset/*.csv
+dataset/*.gz
+dataset/*.tar
+dataset/*.zip
+checkpoints/
+results/
+test_results/
+logs/
+*.npy
+*.pth
+*.pt
+
+# Training outputs
+result_long_term_forecast.txt

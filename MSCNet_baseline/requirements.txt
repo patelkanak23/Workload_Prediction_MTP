@@ -1,0 +1,14 @@
+matplotlib
+numpy
+pandas
+ptflops
+scikit_learn
+scipy
+torch
+PyWavelets
+patool
+tqdm
+sktime
+reformer-pytorch
+torch_geometric
+torchinfo
