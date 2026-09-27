@@ -34,6 +34,7 @@ dataset/*.csv
 dataset/*.gz
 dataset/*.tar
 dataset/*.zip
+raw_data/
 checkpoints/
 results/
 test_results/
