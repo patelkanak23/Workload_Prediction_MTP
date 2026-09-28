@@ -1,7 +1,9 @@
 import os
 import torch
-from models import MSCNet,MSCNet_base
+from models import MSCNet
 
+# Ablation variants
+from models import MSCNet_conv, MSCNet_patch, MSCNet_trend
 
 
 class Exp_Basic(object):
@@ -9,7 +11,9 @@ class Exp_Basic(object):
         self.args = args
         self.model_dict = {
             'MSCNet': MSCNet,
-            'MSCNet_base': MSCNet_base,
+            'MSCNet_conv': MSCNet_conv,
+            'MSCNet_patch': MSCNet_patch,
+            'MSCNet_trend': MSCNet_trend,
         }
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
