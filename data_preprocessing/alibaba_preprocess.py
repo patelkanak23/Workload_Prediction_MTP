@@ -138,7 +138,7 @@ def pass1_sample_machines(csv_path):
 def pass2_filter_and_aggregate(csv_path, sampled_machines):
     """
     Pass 2: Read the CSV in chunks, filter to only sampled machines,
-    aggregate CPU utilization into 5-minute bins.
+    aggregate CPU utilization into 1-minute bins (matching --freq t).
     """
     print(f"\n[PASS 2] Filtering to {len(sampled_machines)} machines and aggregating...")
     filtered_chunks = []
@@ -164,8 +164,8 @@ def pass2_filter_and_aggregate(csv_path, sampled_machines):
             filtered["cpu_util_percent"] = filtered["cpu_util_percent"].clip(0, 100)
 
             if len(filtered) > 0:
-                # Convert timestamp to 5-minute bins (300 seconds)
-                filtered["time_bin"] = (filtered["time_stamp"] // 300).astype(int)
+                # Convert timestamp to 1-minute bins (60 seconds) to match --freq t
+                filtered["time_bin"] = (filtered["time_stamp"] // 60).astype(int)
                 # Average CPU within each bin for each machine
                 agg = filtered.groupby(["machine_id", "time_bin"])["cpu_util_percent"].mean().reset_index()
                 filtered_chunks.append(agg)
@@ -193,7 +193,7 @@ def build_csv(df, output_path):
 
     # Convert time_bin back to datetime
     base_time = pd.Timestamp("2018-01-01 00:00:00")
-    df["datetime"] = base_time + pd.to_timedelta(df["time_bin"] * 300, unit="s")
+    df["datetime"] = base_time + pd.to_timedelta(df["time_bin"] * 60, unit="s")
 
     # Pivot: rows=datetime, columns=machines
     pivot = df.pivot_table(
@@ -215,8 +215,8 @@ def build_csv(df, output_path):
     print(f"[BUILD] Missing values: {missing_pct:.2f}%")
     pivot = pivot.ffill().bfill().fillna(0)
 
-    # Add OT column (mean CPU across all machines - default target for --features S)
-    pivot["OT"] = pivot.mean(axis=1)
+    # Note: No OT column added. Run fix_low_variance.py after this script
+    # to remove low-variance machines and rename the last column to OT.
 
     # Format date column
     pivot = pivot.reset_index()
