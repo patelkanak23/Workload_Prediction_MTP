@@ -8,38 +8,39 @@ from layers.Embed import PatchEmbedding
 from layers.Autoformer_EncDec import series_decomp, series_decomp_multi
 from layers.MSGBlock import GraphBlock, simpleVIT, Attention_Block, Predict
 class AdaptiveGate(nn.Module):
-    """Phase 1: Learns per-window scale weights via Softmax(MLP([mean, std, max])).
+    """Phase 1 v3: Input-conditioned scale gating.
     
-    Uses richer per-scale statistics (mean, std, max) instead of just GAP
-    to give the gate a stronger signal for differentiating scales.
+    Key insight: Compute gate from the RAW temporal input (which preserves
+    workload shape information) instead of from processed scale representations
+    (which are normalized and statistically similar across scales).
+    
+    Uses sigmoid (independent per-scale) instead of softmax (which collapses
+    to uniform due to inter-scale competition).
     """
-    def __init__(self, num_scales=5, hidden_dim=32):
+    def __init__(self, num_scales=5, seq_len=96, hidden_dim=64):
         super().__init__()
-        # 3 statistics (mean, std, max) per scale → 3*S input features
+        self.num_scales = num_scales
+        # Gate sees the full raw temporal signal (L=96 timesteps)
         self.gate = nn.Sequential(
-            nn.Linear(num_scales * 3, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(seq_len, hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, num_scales),
         )
+        # Initialize bias so initial weights are non-uniform
+        # Fine scales (patch 16,24) get higher initial weight than coarse (48,96)
+        with torch.no_grad():
+            self.gate[2].bias.copy_(torch.linspace(0.5, -0.5, num_scales))
 
-    def forward(self, scale_stack):
+    def forward(self, scale_stack, raw_input):
         """
         Args:
             scale_stack: (B*D, S, L) — stacked scale representations
+            raw_input:   (B*D, L) — per-channel temporal signal BEFORE decomposition
         Returns:
             weighted:   (B*D, S, L) — adaptively weighted scales
-            weights:    (B*D, S)    — gate weights (for visualization/analysis)
+            weights:    (B*D, S)    — gate weights for analysis
         """
-        # Step 1: Rich statistics per scale → (B*D, S*3)
-        s_mean = scale_stack.mean(dim=-1)           # (B*D, S)
-        s_std = scale_stack.std(dim=-1)             # (B*D, S)
-        s_max = scale_stack.max(dim=-1).values      # (B*D, S)
-        summaries = torch.cat([s_mean, s_std, s_max], dim=-1)  # (B*D, S*3)
-        
-        # Step 2: MLP → logits → softmax weights
-        weights = torch.softmax(self.gate(summaries), dim=-1)  # (B*D, S)
-        
-        # Step 3: Weighted combination → (B*D, S, L)
+        weights = torch.sigmoid(self.gate(raw_input))  # (B*D, S), each in [0,1]
         weighted = scale_stack * weights.unsqueeze(-1)
         return weighted, weights
 
@@ -57,7 +58,7 @@ class MSPBlock(nn.Module):
         self.act = torch.nn.Tanh()
         self.drop = torch.nn.Dropout(0.05)
 
-        self.adaptive_gate = AdaptiveGate(num_scales=self.k, hidden_dim=32)
+        self.adaptive_gate = AdaptiveGate(num_scales=self.k, seq_len=self.seq_len, hidden_dim=64)
         self.mapping = torch.nn.Linear(self.seq_len, self.seq_len)  # temporal mixing (kept from baseline)
         self.Linear_Scales = nn.ModuleList()
         self.flatten = nn.Flatten(start_dim=-2)
@@ -115,6 +116,9 @@ class MSPBlock(nn.Module):
 
 
     def forward(self, x):
+        # Extract raw per-channel temporal signal for gate conditioning
+        raw_input = x.reshape(x.shape[0] * x.shape[1], -1)  # (B*D, L)
+
         dec_outs = []
 
         for linear, patch in zip(self.Linear_Scales, self.patch_sizes):
@@ -125,7 +129,7 @@ class MSPBlock(nn.Module):
             # print(dec_out.shape)
             dec_outs.append(dec_out)
 
-        dec_out, gate_weights = self.adaptive_gate(torch.stack(dec_outs, dim=1))
+        dec_out, gate_weights = self.adaptive_gate(torch.stack(dec_outs, dim=1), raw_input)
         dec_out = self.mapping(dec_out)  # temporal mixing after gating
         # dec_out = torch.stack(dec_outs, dim=1)
         dec_out, attn = self.codeEncoder(dec_out)
