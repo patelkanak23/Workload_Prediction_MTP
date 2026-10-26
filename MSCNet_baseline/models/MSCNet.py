@@ -8,11 +8,16 @@ from layers.Embed import PatchEmbedding
 from layers.Autoformer_EncDec import series_decomp, series_decomp_multi
 from layers.MSGBlock import GraphBlock, simpleVIT, Attention_Block, Predict
 class AdaptiveGate(nn.Module):
-    """Phase 1: Learns per-window scale weights via Softmax(MLP(pool(scales)))."""
+    """Phase 1: Learns per-window scale weights via Softmax(MLP([mean, std, max])).
+    
+    Uses richer per-scale statistics (mean, std, max) instead of just GAP
+    to give the gate a stronger signal for differentiating scales.
+    """
     def __init__(self, num_scales=5, hidden_dim=32):
         super().__init__()
+        # 3 statistics (mean, std, max) per scale → 3*S input features
         self.gate = nn.Sequential(
-            nn.Linear(num_scales, hidden_dim),
+            nn.Linear(num_scales * 3, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_scales),
         )
@@ -25,11 +30,16 @@ class AdaptiveGate(nn.Module):
             weighted:   (B*D, S, L) — adaptively weighted scales
             weights:    (B*D, S)    — gate weights (for visualization/analysis)
         """
-        # Step 1: Global Average Pool over temporal dim -> (B*D, S)
-        summaries = scale_stack.mean(dim=-1)
-        # Step 2: MLP -> logits -> softmax weights
-        weights = torch.softmax(self.gate(summaries), dim=-1)
-        # Step 3: Weighted combination -> (B*D, S, L)
+        # Step 1: Rich statistics per scale → (B*D, S*3)
+        s_mean = scale_stack.mean(dim=-1)           # (B*D, S)
+        s_std = scale_stack.std(dim=-1)             # (B*D, S)
+        s_max = scale_stack.max(dim=-1).values      # (B*D, S)
+        summaries = torch.cat([s_mean, s_std, s_max], dim=-1)  # (B*D, S*3)
+        
+        # Step 2: MLP → logits → softmax weights
+        weights = torch.softmax(self.gate(summaries), dim=-1)  # (B*D, S)
+        
+        # Step 3: Weighted combination → (B*D, S, L)
         weighted = scale_stack * weights.unsqueeze(-1)
         return weighted, weights
 
@@ -48,6 +58,7 @@ class MSPBlock(nn.Module):
         self.drop = torch.nn.Dropout(0.05)
 
         self.adaptive_gate = AdaptiveGate(num_scales=self.k, hidden_dim=32)
+        self.mapping = torch.nn.Linear(self.seq_len, self.seq_len)  # temporal mixing (kept from baseline)
         self.Linear_Scales = nn.ModuleList()
         self.flatten = nn.Flatten(start_dim=-2)
         self.codeEncoders = nn.ModuleList()
@@ -115,6 +126,7 @@ class MSPBlock(nn.Module):
             dec_outs.append(dec_out)
 
         dec_out, gate_weights = self.adaptive_gate(torch.stack(dec_outs, dim=1))
+        dec_out = self.mapping(dec_out)  # temporal mixing after gating
         # dec_out = torch.stack(dec_outs, dim=1)
         dec_out, attn = self.codeEncoder(dec_out)
         # dec_out, attn = self.codeEncoder(x.reshape(x.shape[0] * x.shape[1], 1, -1))
