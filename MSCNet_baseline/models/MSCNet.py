@@ -7,55 +7,63 @@ from layers.SelfAttention_Family import FullAttention, AttentionLayer, Attention
 from layers.Embed import PatchEmbedding
 from layers.Autoformer_EncDec import series_decomp, series_decomp_multi
 from layers.MSGBlock import GraphBlock, simpleVIT, Attention_Block, Predict
-class AdaptiveGate(nn.Module):
-    """Phase 1 v4: Cross-scale context injection.
-    
-    WHY v1-v3 FAILED: Scalar gating (w_i * scale_i) before a Linear layer is
-    mathematically absorbed: Linear(w*x) = w*Linear(x). Gate gradients vanish.
-    
-    FIX: Compute a WEIGHTED SUM across scales (cross-scale context) and ADD it
-    as a residual. This input-dependent cross-scale mixing CANNOT be replicated
-    by any fixed downstream layer. Replaces self.mapping entirely.
-    """
-    def __init__(self, num_scales=5, seq_len=96, hidden_dim=64):
-        super().__init__()
-        self.num_scales = num_scales
-        self.seq_len = seq_len
-        # Gate MLP: raw input -> scale attention weights
-        self.gate = nn.Sequential(
-            nn.Linear(seq_len, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, num_scales),
-        )
-        # Learnable projection for the context vector
-        self.context_proj = nn.Linear(seq_len, seq_len)
 
-    def forward(self, scale_stack, raw_input):
+
+class RegimeDetector(nn.Module):
+    """Phase 2: Computes a soft regime embedding from raw input statistics.
+
+    Operates on the raw (pre-RevIN) input window to extract distributional
+    features that RevIN discards, then maps them to a learnable embedding.
+
+    Features extracted (per channel):
+        1. Mean (μ)          — removed by RevIN centering
+        2. Std dev (σ)       — removed by RevIN scaling
+        3. Trend (slope)     — removed by RevIN normalization
+        4. Kurtosis          — normalized away by RevIN
+        5. Autocorrelation   — not captured by per-window RevIN
+    """
+    def __init__(self, d_regime=16):
+        super().__init__()
+        # 5 statistical features -> regime embedding
+        self.embed = nn.Sequential(
+            nn.Linear(5, 32),
+            nn.GELU(),
+            nn.Linear(32, d_regime),
+        )
+
+    def forward(self, x):
         """
         Args:
-            scale_stack: (B*D, S, L) -- stacked scale representations
-            raw_input:   (B*D, L) -- per-channel temporal signal
+            x: (B, L, D) — raw input BEFORE RevIN
         Returns:
-            output:     (B*D, S, L) -- scales enriched with gated cross-scale context
-            weights:    (B*D, S)    -- gate weights for analysis
+            regime: (B, D, d_regime) — per-channel regime embedding
         """
-        # Step 1: Compute soft attention weights over scales
-        weights = torch.softmax(self.gate(raw_input), dim=-1)  # (B*D, S)
-        
-        # Step 2: Weighted sum across scales -> single context vector
-        # This MIXES information across scales -- cannot be undone by fixed layers
-        context = (scale_stack * weights.unsqueeze(-1)).sum(dim=1)  # (B*D, L)
-        
-        # Step 3: Project context (adds learned transformation)
-        context = self.context_proj(context)  # (B*D, L)
-        
-        # Step 4: Add context to each scale as residual
-        output = scale_stack + context.unsqueeze(1)  # (B*D, S, L)
-        
-        return output, weights
+        x_t = x.permute(0, 2, 1)  # (B, D, L)
+
+        mu    = x_t.mean(dim=-1, keepdim=True)           # (B, D, 1)
+        sigma = x_t.std(dim=-1, keepdim=True) + 1e-6     # (B, D, 1)
+
+        # Trend: slope approximation (last - first) / L
+        trend = (x_t[..., -1:] - x_t[..., :1]) / x_t.shape[-1]  # (B, D, 1)
+
+        # Kurtosis: 4th moment / variance^2
+        x_norm = (x_t - mu) / sigma
+        kurtosis = (x_norm ** 4).mean(dim=-1, keepdim=True)       # (B, D, 1)
+
+        # Autocorrelation at lag-1
+        x_c = x_t - mu
+        autocorr = (x_c[..., 1:] * x_c[..., :-1]).mean(dim=-1, keepdim=True) / (sigma ** 2 + 1e-6)  # (B, D, 1)
+
+        # Concat 5 features -> (B, D, 5)
+        features = torch.cat([mu, sigma, trend, kurtosis, autocorr], dim=-1)
+
+        # Embed -> (B, D, d_regime)
+        regime = self.embed(features)
+        return regime
 
 
 class MSPBlock(nn.Module):
+    """Multi-Scale Patching Block — Phase 0 baseline (static mapping)."""
     def __init__(self, configs, patch_sizes=[16,24,32,48,96], kernel_sizes=[6,12,24]):
         # 6,12,24   19,24,32, 16,24,32,48,96, 16,32,96   16
         super().__init__()
@@ -68,7 +76,8 @@ class MSPBlock(nn.Module):
         self.act = torch.nn.Tanh()
         self.drop = torch.nn.Dropout(0.05)
 
-        self.adaptive_gate = AdaptiveGate(num_scales=self.k, seq_len=self.seq_len, hidden_dim=64)
+        # Phase 0: Static scale mapping (restored from baseline)
+        self.mapping = nn.Linear(self.seq_len, self.seq_len)
         self.Linear_Scales = nn.ModuleList()
         self.flatten = nn.Flatten(start_dim=-2)
         self.codeEncoders = nn.ModuleList()
@@ -125,9 +134,6 @@ class MSPBlock(nn.Module):
 
 
     def forward(self, x):
-        # Extract raw per-channel temporal signal for gate conditioning
-        raw_input = x.reshape(x.shape[0] * x.shape[1], -1)  # (B*D, L)
-
         dec_outs = []
 
         for linear, patch in zip(self.Linear_Scales, self.patch_sizes):
@@ -138,8 +144,8 @@ class MSPBlock(nn.Module):
             # print(dec_out.shape)
             dec_outs.append(dec_out)
 
-        dec_out, gate_weights = self.adaptive_gate(torch.stack(dec_outs, dim=1), raw_input)
-        # dec_out = torch.stack(dec_outs, dim=1)
+        # Phase 0: Static mapping across scales
+        dec_out = self.mapping(torch.stack(dec_outs, dim=1))
         dec_out, attn = self.codeEncoder(dec_out)
         # dec_out, attn = self.codeEncoder(x.reshape(x.shape[0] * x.shape[1], 1, -1))
 
@@ -184,6 +190,10 @@ class Model(nn.Module):
         self.channels = configs.enc_in
         self.model = nn.ModuleList([MSPBlock(configs) for _ in range(configs.e_layers)])
 
+        # Phase 2: Regime-Aware Gating
+        self.regime_detector = RegimeDetector(d_regime=16)
+        self.regime_proj = nn.Linear(16, configs.seq_len)  # project regime embedding to seq_len
+
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
 
@@ -193,6 +203,10 @@ class Model(nn.Module):
             (1 / self.seq_len) * torch.ones([self.pred_len, self.seq_len]))
 
     def encoder(self, x):
+        # Phase 2: Capture raw input BEFORE RevIN for regime detection
+        x_raw = x.clone().detach()
+
+        # RevIN normalization
         means = x.mean(1, keepdim=True).detach()
         x_enc = x - means
         stdev = torch.sqrt(
@@ -206,6 +220,12 @@ class Model(nn.Module):
             0, 2, 1), trend_init.permute(0, 2, 1)
 
         seasonal_init = x_enc.permute(0, 2, 1)
+
+        # Phase 2: Compute regime embedding from raw (pre-RevIN) input
+        regime = self.regime_detector(x_raw)        # (B, D, 16)
+        regime_bias = self.regime_proj(regime)       # (B, D, L)
+        seasonal_init = seasonal_init + regime_bias  # inject regime as additive bias
+
         for i in range(self.layer):
             seasonal_init = self.layer_norm(self.model[i](seasonal_init))
 
