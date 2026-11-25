@@ -10,23 +10,28 @@ from layers.MSGBlock import GraphBlock, simpleVIT, Attention_Block, Predict
 
 
 class RegimeDetector(nn.Module):
-    """Phase 2: Computes a soft regime embedding from raw input statistics.
+    """Phase 2 v3: Scale-invariant regime embedding from raw input statistics.
 
-    Operates on the raw (pre-RevIN) input window to extract distributional
-    features that RevIN discards, then maps them to a learnable embedding.
+    v1/v2 failure: Including raw μ and σ as features caused the regime bias
+    to encode absolute signal level, creating a systematic mean-shift after
+    RevIN inverse that improved MSE (fewer large errors) but worsened MAE
+    (systematic offset on every prediction).
 
-    Features extracted (per channel):
-        1. Mean (μ)          — removed by RevIN centering
-        2. Std dev (σ)       — removed by RevIN scaling
-        3. Trend (slope)     — removed by RevIN normalization
-        4. Kurtosis          — normalized away by RevIN
-        5. Autocorrelation   — not captured by per-window RevIN
+    v3 fix: Use ONLY 3 scale-invariant features that describe regime SHAPE,
+    not absolute level. None of these can encode "this channel is high/low":
+
+        1. Normalized trend  — (last-first)/σ: direction+speed, scale-free
+        2. Kurtosis          — E[(x-μ)⁴/σ⁴]: spiky burst vs flat plateau
+        3. Autocorr lag-1    — corr(xₜ, xₜ₋₁): periodic vs noisy
+
+    These features survive RevIN (they are computed on raw x for
+    informational richness) but cannot induce a mean shift.
     """
     def __init__(self, d_regime=16):
         super().__init__()
-        # 5 statistical features -> regime embedding
+        # 3 scale-invariant features -> regime embedding
         self.embed = nn.Sequential(
-            nn.Linear(5, 32),
+            nn.Linear(3, 32),
             nn.GELU(),
             nn.Linear(32, d_regime),
         )
@@ -40,22 +45,21 @@ class RegimeDetector(nn.Module):
         """
         x_t = x.permute(0, 2, 1)  # (B, D, L)
 
-        mu    = x_t.mean(dim=-1, keepdim=True)           # (B, D, 1)
-        sigma = x_t.std(dim=-1, keepdim=True) + 1e-6     # (B, D, 1)
+        mu    = x_t.mean(dim=-1, keepdim=True)        # (B, D, 1)
+        sigma = x_t.std(dim=-1, keepdim=True) + 1e-6  # (B, D, 1)
+        x_norm = (x_t - mu) / sigma                   # standardized
 
-        # Trend: slope approximation (last - first) / L
-        trend = (x_t[..., -1:] - x_t[..., :1]) / x_t.shape[-1]  # (B, D, 1)
+        # Feature 1: Normalized trend — scale-invariant slope
+        norm_trend = (x_t[..., -1:] - x_t[..., :1]) / sigma  # (B, D, 1)
 
-        # Kurtosis: 4th moment / variance^2
-        x_norm = (x_t - mu) / sigma
-        kurtosis = (x_norm ** 4).mean(dim=-1, keepdim=True)       # (B, D, 1)
+        # Feature 2: Kurtosis — 4th standardized moment (scale-invariant by def)
+        kurtosis = (x_norm ** 4).mean(dim=-1, keepdim=True)   # (B, D, 1)
 
-        # Autocorrelation at lag-1
-        x_c = x_t - mu
-        autocorr = (x_c[..., 1:] * x_c[..., :-1]).mean(dim=-1, keepdim=True) / (sigma ** 2 + 1e-6)  # (B, D, 1)
+        # Feature 3: Autocorrelation at lag-1 (scale-invariant by def)
+        autocorr = (x_norm[..., 1:] * x_norm[..., :-1]).mean(dim=-1, keepdim=True)  # (B, D, 1)
 
-        # Concat 5 features -> (B, D, 5)
-        features = torch.cat([mu, sigma, trend, kurtosis, autocorr], dim=-1)
+        # Concat 3 scale-invariant features -> (B, D, 3)
+        features = torch.cat([norm_trend, kurtosis, autocorr], dim=-1)
 
         # Embed -> (B, D, d_regime)
         regime = self.embed(features)
