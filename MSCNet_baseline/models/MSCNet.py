@@ -190,9 +190,10 @@ class Model(nn.Module):
         self.channels = configs.enc_in
         self.model = nn.ModuleList([MSPBlock(configs) for _ in range(configs.e_layers)])
 
-        # Phase 2: Regime-Aware Gating
+        # Phase 2: Regime-Aware Gating (with learnable scale, init=0.01)
         self.regime_detector = RegimeDetector(d_regime=16)
         self.regime_proj = nn.Linear(16, configs.seq_len)  # project regime embedding to seq_len
+        self.regime_scale = nn.Parameter(torch.tensor(0.01))  # controls injection magnitude
 
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
@@ -224,7 +225,7 @@ class Model(nn.Module):
         # Phase 2: Compute regime embedding from raw (pre-RevIN) input
         regime = self.regime_detector(x_raw)        # (B, D, 16)
         regime_bias = self.regime_proj(regime)       # (B, D, L)
-        seasonal_init = seasonal_init + regime_bias  # inject regime as additive bias
+        seasonal_init = seasonal_init + self.regime_scale * regime_bias  # scaled injection
 
         for i in range(self.layer):
             seasonal_init = self.layer_norm(self.model[i](seasonal_init))
