@@ -194,10 +194,14 @@ class Model(nn.Module):
         self.channels = configs.enc_in
         self.model = nn.ModuleList([MSPBlock(configs) for _ in range(configs.e_layers)])
 
-        # Phase 2: Regime-Aware Gating (with learnable scale, init=0.01)
+        # Phase 2 v4: Regime-Aware Multiplicative Gating
+        # v1-v3 used ADDITIVE injection (seasonal_init + bias), which creates a
+        # systematic mean-shift after RevIN inverse → MSE↓ but MAE↑ divergence.
+        # v4 uses MULTIPLICATIVE gating: seasonal_init * (1 + scale*tanh(proj))
+        # This scales existing patterns without shifting the mean.
         self.regime_detector = RegimeDetector(d_regime=16)
         self.regime_proj = nn.Linear(16, configs.seq_len)  # project regime embedding to seq_len
-        self.regime_scale = nn.Parameter(torch.tensor(0.01))  # controls injection magnitude
+        self.regime_scale = nn.Parameter(torch.tensor(0.01))  # controls gate magnitude
 
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
@@ -226,10 +230,13 @@ class Model(nn.Module):
 
         seasonal_init = x_enc.permute(0, 2, 1)
 
-        # Phase 2: Compute regime embedding from raw (pre-RevIN) input
-        regime = self.regime_detector(x_raw)        # (B, D, 16)
-        regime_bias = self.regime_proj(regime)       # (B, D, L)
-        seasonal_init = seasonal_init + self.regime_scale * regime_bias  # scaled injection
+        # Phase 2 v4: Multiplicative regime gating (NOT additive)
+        # gate ≈ 1.0 at init (regime_scale=0.01), bounded by tanh to [-1,1]
+        # Scales existing temporal patterns without shifting the mean
+        regime = self.regime_detector(x_raw)                              # (B, D, 16)
+        regime_raw = self.regime_proj(regime)                             # (B, D, L)
+        regime_gate = 1.0 + self.regime_scale * torch.tanh(regime_raw)   # (B, D, L), ≈1.0 initially
+        seasonal_init = seasonal_init * regime_gate                       # multiplicative modulation
 
         for i in range(self.layer):
             seasonal_init = self.layer_norm(self.model[i](seasonal_init))
